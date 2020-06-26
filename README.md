@@ -17,7 +17,7 @@ MRuby::Build.new do |conf|
 
     # ... (snip) ...
 
-    conf.gem :git => 'https://github.com/luisbebop/mruby-polarssl.git'
+    conf.gem :git => 'https://github.com/WSandwitch/mruby-polarssl.git'
 end
 ```
 
