@@ -27,7 +27,7 @@ end
 ruby run_test.rb test
 ```
 
-## Usage
+## Usage client
 ```ruby
 socket = TCPSocket.new('polarssl.org', 443)
 
@@ -36,7 +36,7 @@ ctr_drbg = PolarSSL::CtrDrbg.new(entropy)
 
 ssl = PolarSSL::SSL.new
 ssl.set_endpoint(PolarSSL::SSL::SSL_IS_CLIENT)
-ssl.set_authmode(PolarSSL::SSL::SSL_VERIFY_NONE)
+ssl.set_authmode(PolarSSL::SSL::SSL_VERIFY_OPTIONAL)
 ssl.set_rng(ctr_drbg)
 ssl.set_socket(socket)
 
@@ -57,6 +57,57 @@ socket.close
 
 ssl.close
 ```
+
+## Usage server
+```ruby
+entropy = PolarSSL::Entropy.new
+ctr_drbg = PolarSSL::CtrDrbg.new(entropy)
+
+x509 = PolarSSL::X509.new
+puts x509.parse(File.open("serv/server101.mycloud.pem","r"){|f| f.read})
+
+ca = PolarSSL::X509.new
+puts ca.parse(File.open("serv/rootCA.crt","r"){|f| f.read})
+
+pkey = PolarSSL::PK.new(File.open("serv/rootCA.key","r"){|f| f.read})
+
+conf = PolarSSL::Conf.new(PolarSSL::Conf::SSL_IS_SERVER)
+conf.set_authmode(PolarSSL::Conf::SSL_VERIFY_NONE)
+conf.set_rng(ctr_drbg)
+conf.set_chain(x509)
+conf.set_sert(ca, pkey)
+
+
+ssl = PolarSSL::SSL.new
+ssl.setup(conf)
+
+tcp = TCPServer.new("0.0.0.0", 3000)
+
+loop do
+  ssl.reset 
+  io = BasicSocket.for_fd(tcp.sysaccept)
+  io.setsockopt(Socket::SOL_SOCKET, Socket::SO_NOSIGPIPE, true) if Socket.const_defined? :SO_NOSIGPIPE
+  puts "got connection"
+  ssl.set_socket(io)
+  
+  puts (ssl.handshake rescue "false")
+
+  begin
+	p ssl.read(1024)
+	ssl.write("hello")
+  rescue => e  
+  p e
+	raise 'Connection reset by peer' if io.closed?
+  ensure
+    sleep(1)
+	ssl.close_notify
+	io.close rescue nil
+	GC.start 
+  end
+end
+
+```
+
 
 ### Encrypting data
 
