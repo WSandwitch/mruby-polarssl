@@ -30,6 +30,10 @@
 #include <string.h>
 #include <stdio.h>
 
+#if defined(_Baget_)
+	#include <sys/filio.h>
+#endif
+
 #if MRUBY_RELEASE_NO < 10000
 static struct RClass *mrb_module_get(mrb_state *mrb, const char *name) {
   return mrb_class_get(mrb, name);
@@ -38,15 +42,37 @@ static struct RClass *mrb_module_get(mrb_state *mrb, const char *name) {
 
 extern struct mrb_data_type mrb_io_type;
 
+static void mrb_x509_free(mrb_state *mrb, void *ptr) {
+  void *ecdsa = ptr;
+
+  if (ecdsa != NULL) {
+    mbedtls_x509_crt_free(ecdsa);
+    mrb_free(mrb, ptr);
+  }
+}
+
+static void mrb_pkey_free(mrb_state *mrb, void *ptr) {
+  void *ecdsa = ptr;
+
+  if (ecdsa != NULL) {
+    mbedtls_pk_free(ecdsa);
+    mrb_free(mrb, ptr);
+  }
+}
+
+static void mrb_conf_free(mrb_state *mrb, void *ptr) {
+  void *ecdsa = ptr;
+
+  if (ecdsa != NULL) {
+    mbedtls_ssl_config_free(ecdsa);
+    mrb_free(mrb, ptr);
+  }
+}
+
 static void mrb_ssl_free(mrb_state *mrb, void *ptr) {
   mbedtls_ssl_context *ssl = ptr;
 
   if (ssl != NULL) {
-    if (ssl->conf != NULL) {
-      mbedtls_ssl_config_free((mbedtls_ssl_config  *)ssl->conf);
-      mrb_free(mrb, (mbedtls_ssl_config  *)ssl->conf);
-      ssl->conf = NULL;
-    }
 
     mbedtls_ssl_free(ssl);
     mrb_free(mrb, ssl);
@@ -56,6 +82,9 @@ static void mrb_ssl_free(mrb_state *mrb, void *ptr) {
 static struct mrb_data_type mrb_entropy_type = { "Entropy", mrb_free };
 static struct mrb_data_type mrb_ctr_drbg_type = { "CtrDrbg", mrb_free };
 static struct mrb_data_type mrb_ssl_type = { "SSL", mrb_ssl_free };
+static struct mrb_data_type mrb_x509_type = { "X509", mrb_x509_free };
+static struct mrb_data_type mrb_pkey_type = { "PK", mrb_pkey_free };
+static struct mrb_data_type mrb_conf_type = { "Conf", mrb_conf_free };
 
 static void entropycheck(mrb_state *mrb, mrb_value self, mbedtls_entropy_context **entropyp) {
   mbedtls_entropy_context *entropy;
@@ -136,6 +165,78 @@ static mrb_value mrb_ctrdrbg_initialize(mrb_state *mrb, mrb_value self) {
   return self;
 }
 
+static mrb_value mrb_pkey_initialize(mrb_state *mrb, mrb_value self) {
+  mbedtls_pk_context *pkey;
+  mrb_value pem;
+  char error[40];
+  int ret;
+
+  pkey = (mbedtls_pk_context *)DATA_PTR(self);
+  if (pkey) {
+    mrb_free(mrb, pkey);
+  }
+  DATA_TYPE(self) = &mrb_pkey_type;
+  DATA_PTR(self) = NULL;
+
+  pkey = (mbedtls_pk_context *)mrb_malloc(mrb, sizeof(mbedtls_pk_context));
+  DATA_PTR(self) = pkey;
+
+  mbedtls_pk_init(pkey);
+  mrb_get_args(mrb, "S", &pem);
+  ret=mbedtls_pk_parse_key( pkey, (const unsigned char *) RSTRING_PTR(pem), RSTRING_LEN(pem)+1, NULL, 0 ); 
+  if (ret == 0) {
+    return self;
+  }
+  mbedtls_pk_free(pkey);
+   sprintf(error, "can't create pkey %d", ret);
+  mrb_raise(mrb, E_RUNTIME_ERROR, error);
+  return self;
+}
+
+static mrb_value mrb_x509_initialize(mrb_state *mrb, mrb_value self) {
+  mbedtls_x509_crt *crt;
+  
+  mrb_value mcrt;
+  int ret;
+
+  crt = (mbedtls_x509_crt *)DATA_PTR(self);
+  if (crt) {
+    mrb_free(mrb, crt);
+  }
+  DATA_TYPE(self) = &mrb_x509_type;
+  DATA_PTR(self) = NULL;
+
+  crt = (mbedtls_x509_crt *)mrb_malloc(mrb, sizeof(mbedtls_x509_crt));
+  DATA_PTR(self) = crt;
+
+  mbedtls_x509_crt_init(crt);
+
+  return self;
+}
+
+static mrb_value mrb_x509_parse(mrb_state *mrb, mrb_value self) {
+  mbedtls_x509_crt *crt;
+  mrb_value pem;
+  int ret = 0;
+  char error[30] = {0};
+
+  mrb_get_args(mrb, "S", &pem);
+
+  crt = DATA_CHECK_GET_PTR(mrb, self, &mrb_x509_type, mbedtls_x509_crt);
+  
+  ret = mbedtls_x509_crt_parse( crt, (const unsigned char *) RSTRING_PTR(pem), RSTRING_LEN(pem)+1);
+
+  if (ret == 0) {
+    return mrb_true_value();
+  }
+
+  sprintf(error, "can't parse cert %d", ret);
+
+  mrb_raise(mrb, E_RUNTIME_ERROR, error);
+  return mrb_false_value();
+}
+
+
 static mrb_value mrb_ctrdrbg_self_test() {
   if( mbedtls_ctr_drbg_self_test(0) == 0 ) {
     return mrb_true_value();
@@ -160,7 +261,6 @@ static void my_debug_func( void *ctx, int level,
 
 static mrb_value mrb_ssl_initialize(mrb_state *mrb, mrb_value self) {
   mbedtls_ssl_context *ssl;
-  mbedtls_ssl_config *conf;
 
 #if MBEDTLS_VERSION_MAJOR == 1 && MBEDTLS_VERSION_MINOR == 1
   ssl_session *ssn;
@@ -178,19 +278,6 @@ static mrb_value mrb_ssl_initialize(mrb_state *mrb, mrb_value self) {
 
   mbedtls_ssl_init(ssl);
 
-  conf = (mbedtls_ssl_config *)mrb_malloc(mrb, sizeof(mbedtls_ssl_config));
-  mbedtls_ssl_config_init( conf );
-
-  mbedtls_ssl_config_defaults( conf, MBEDTLS_SSL_IS_CLIENT,
-      MBEDTLS_SSL_TRANSPORT_STREAM, MBEDTLS_SSL_PRESET_DEFAULT );
-
-#if defined(MRUBY_MBEDTLS_DEBUG_C)
-  mbedtls_ssl_conf_dbg( conf, my_debug_func, stdout );
-  mbedtls_debug_set_threshold(5);
-#endif
-
-  mbedtls_ssl_setup( ssl, conf );
-
 #if MBEDTLS_VERSION_MAJOR == 1 && MBEDTLS_VERSION_MINOR == 1
   ssn = (ssl_session *)mrb_malloc(mrb, sizeof(ssl_session));
   ssl_set_session( ssl, 0, 600, ssn );
@@ -200,37 +287,69 @@ static mrb_value mrb_ssl_initialize(mrb_state *mrb, mrb_value self) {
   return self;
 }
 
-static mrb_value mrb_ssl_set_endpoint(mrb_state *mrb, mrb_value self) {
-  mbedtls_ssl_context *ssl;
+static mrb_value mrb_conf_initialize(mrb_state *mrb, mrb_value self) {
+  mbedtls_ssl_config *conf;
   mrb_int endpoint_mode;
 
   mrb_get_args(mrb, "i", &endpoint_mode);
-  ssl = DATA_CHECK_GET_PTR(mrb, self, &mrb_ssl_type, mbedtls_ssl_context);
-  mbedtls_ssl_conf_authmode((mbedtls_ssl_config  *)ssl->conf, endpoint_mode);
+  DATA_TYPE(self) = &mrb_conf_type;
+  DATA_PTR(self) = NULL;
+
+  conf = (mbedtls_ssl_config *)mrb_malloc(mrb, sizeof(mbedtls_ssl_config));
+  DATA_PTR(self) = conf;
+	
+  mbedtls_ssl_config_init( conf );
+
+  mbedtls_ssl_config_defaults( conf, endpoint_mode,
+      MBEDTLS_SSL_TRANSPORT_STREAM, MBEDTLS_SSL_PRESET_DEFAULT );
+
+  return self;
+}
+
+static mrb_value mrb_conf_set_endpoint(mrb_state *mrb, mrb_value self) {
+  mbedtls_ssl_config *ssl;
+  mrb_int endpoint_mode;
+
+  mrb_get_args(mrb, "i", &endpoint_mode);
+  ssl = DATA_CHECK_GET_PTR(mrb, self, &mrb_conf_type, mbedtls_ssl_config);
+  mbedtls_ssl_conf_authmode((mbedtls_ssl_config  *)ssl, endpoint_mode);
   return mrb_true_value();
 }
 
-static mrb_value mrb_ssl_set_authmode(mrb_state *mrb, mrb_value self) {
-  mbedtls_ssl_context *ssl;
+static mrb_value mrb_conf_set_authmode(mrb_state *mrb, mrb_value self) {
+  mbedtls_ssl_config *ssl;
   mrb_int authmode;
 
   mrb_get_args(mrb, "i", &authmode);
-  ssl = DATA_CHECK_GET_PTR(mrb, self, &mrb_ssl_type, mbedtls_ssl_context);
-  mbedtls_ssl_conf_authmode((mbedtls_ssl_config  *)ssl->conf, authmode);
+  ssl = DATA_CHECK_GET_PTR(mrb, self, &mrb_conf_type, mbedtls_ssl_config);
+  mbedtls_ssl_conf_authmode((mbedtls_ssl_config  *)ssl, authmode);
   return mrb_true_value();
 }
 
-static mrb_value mrb_ssl_set_rng(mrb_state *mrb, mrb_value self) {
-  mbedtls_ssl_context *ssl;
+static mrb_value mrb_conf_set_rng(mrb_state *mrb, mrb_value self) {
+  mbedtls_ssl_config *ssl;
   mbedtls_ctr_drbg_context *ctr_drbg;
   mrb_value rng;
 
   mrb_get_args(mrb, "o", &rng);
   mrb_data_check_type(mrb, rng, &mrb_ctr_drbg_type);
   ctr_drbg = DATA_CHECK_GET_PTR(mrb, rng, &mrb_ctr_drbg_type, mbedtls_ctr_drbg_context);
-  ssl = DATA_CHECK_GET_PTR(mrb, self, &mrb_ssl_type, mbedtls_ssl_context);
+  ssl = DATA_CHECK_GET_PTR(mrb, self, &mrb_conf_type, mbedtls_ssl_config);
 
-  mbedtls_ssl_conf_rng((mbedtls_ssl_config  *)ssl->conf, &mbedtls_ctr_drbg_random, ctr_drbg);
+  mbedtls_ssl_conf_rng((mbedtls_ssl_config  *)ssl, &mbedtls_ctr_drbg_random, ctr_drbg);
+  return mrb_true_value();
+}
+
+static mrb_value mrb_ssl_setup(mrb_state *mrb, mrb_value self) {
+  mbedtls_ssl_context *ssl;
+  mbedtls_ssl_config *fptr;
+  mrb_value socket;
+
+  mrb_get_args(mrb, "o", &socket);
+  mrb_data_check_type(mrb, socket, &mrb_conf_type);
+  fptr = DATA_CHECK_GET_PTR(mrb, socket, &mrb_conf_type, mbedtls_ssl_config);
+  ssl = DATA_CHECK_GET_PTR(mrb, self, &mrb_ssl_type, mbedtls_ssl_context);
+  mbedtls_ssl_setup( ssl, fptr ); 
   return mrb_true_value();
 }
 
@@ -244,6 +363,45 @@ static mrb_value mrb_ssl_set_socket(mrb_state *mrb, mrb_value self) {
   fptr = DATA_CHECK_GET_PTR(mrb, socket, &mrb_io_type, struct mrb_io);
   ssl = DATA_CHECK_GET_PTR(mrb, self, &mrb_ssl_type, mbedtls_ssl_context);
   mbedtls_ssl_set_bio( ssl, fptr, mbedtls_net_send, mbedtls_net_recv, NULL ); // timeout recv
+  return mrb_true_value();
+}
+
+static mrb_value mrb_conf_set_chain(mrb_state *mrb, mrb_value self) {
+  mbedtls_ssl_config *ssl;
+  mbedtls_x509_crt *crt;
+  mrb_value chain;
+
+  mrb_get_args(mrb, "o", &chain);
+  mrb_data_check_type(mrb, chain, &mrb_x509_type);
+  crt = DATA_CHECK_GET_PTR(mrb, chain, &mrb_x509_type, mbedtls_x509_crt);
+  ssl = DATA_CHECK_GET_PTR(mrb, self, &mrb_conf_type, mbedtls_ssl_config);
+  mbedtls_ssl_conf_ca_chain( ssl, crt, NULL ); // timeout recv
+  return mrb_true_value();
+}
+
+static mrb_value mrb_conf_set_sert(mrb_state *mrb, mrb_value self) {
+  int ret;
+  char error[60] = {0};
+  mbedtls_ssl_config *ssl;
+  mbedtls_x509_crt *crt;
+  mrb_value sert, pem;
+  mbedtls_pk_context *pkey;
+
+  mrb_get_args(mrb, "oo", &sert, &pem);
+  
+  mrb_data_check_type(mrb, sert, &mrb_x509_type);
+  mrb_data_check_type(mrb, pem, &mrb_pkey_type);
+  crt = DATA_CHECK_GET_PTR(mrb, sert, &mrb_x509_type, mbedtls_x509_crt);
+  pkey = DATA_CHECK_GET_PTR(mrb, pem, &mrb_pkey_type, mbedtls_pk_context);
+  ssl = DATA_CHECK_GET_PTR(mrb, self, &mrb_conf_type, mbedtls_ssl_config);
+  ret = mbedtls_ssl_conf_own_cert( ssl, crt, pkey  ); 
+  if (ret){
+    sprintf(error, "failed  !  mbedtls_ssl_conf_own_cert returned %d", ret);
+
+    mrb_raise(mrb, E_RUNTIME_ERROR, error);
+    return mrb_false_value();
+  }
+	
   return mrb_true_value();
 }
 
@@ -348,6 +506,17 @@ static mrb_value mrb_ssl_close(mrb_state *mrb, mrb_value self) {
   mbedtls_ssl_context *ssl;
 
   ssl = DATA_CHECK_GET_PTR(mrb, self, &mrb_ssl_type, mbedtls_ssl_context);
+  return mrb_true_value();
+}
+
+static mrb_value mrb_ssl_reset(mrb_state *mrb, mrb_value self) {
+  mbedtls_ssl_context *ssl;
+  int ret;
+
+  ssl = DATA_CHECK_GET_PTR(mrb, self, &mrb_ssl_type, mbedtls_ssl_context);
+
+  mbedtls_ssl_session_reset(ssl);
+
   return mrb_true_value();
 }
 
@@ -699,10 +868,14 @@ static mrb_value mrb_base64_decode(mrb_state *mrb, mrb_value self) {
 }
 
 void mrb_mruby_polarssl_gem_init(mrb_state *mrb) {
-  struct RClass *p, *e, *c, *s, *pkey, *ecdsa, *cipher, *des, *des3, *base64;
+  struct RClass *p, *e, *c, *s, *pkey, *ecdsa, *cipher, *des, *des3, *base64, *x, *conf, *pk;
 
   p = mrb_define_module(mrb, "PolarSSL");
   pkey = mrb_define_module_under(mrb, p, "PKey");
+	
+  pk = mrb_define_class_under(mrb, p, "PK", mrb->object_class);
+  MRB_SET_INSTANCE_TT(pk, MRB_TT_DATA);
+  mrb_define_method(mrb, pk, "initialize", mrb_pkey_initialize, MRB_ARGS_REQ(1) | MRB_ARGS_OPT(1));
 
   e = mrb_define_class_under(mrb, p, "Entropy", mrb->object_class);
   MRB_SET_INSTANCE_TT(e, MRB_TT_DATA);
@@ -714,20 +887,33 @@ void mrb_mruby_polarssl_gem_init(mrb_state *mrb) {
   mrb_define_method(mrb, c, "initialize", mrb_ctrdrbg_initialize, MRB_ARGS_REQ(1) | MRB_ARGS_OPT(1));
   mrb_define_singleton_method(mrb, (struct RObject*)c, "self_test", mrb_ctrdrbg_self_test, MRB_ARGS_NONE());
 
+  x = mrb_define_class_under(mrb, p, "X509", mrb->object_class);
+  MRB_SET_INSTANCE_TT(x, MRB_TT_DATA);
+  mrb_define_method(mrb, x, "initialize", mrb_x509_initialize, MRB_ARGS_NONE());
+  mrb_define_method(mrb, x, "parse", mrb_x509_parse, MRB_ARGS_REQ(1) | MRB_ARGS_OPT(1));
+ 
+  conf = mrb_define_class_under(mrb, p, "Conf", mrb->object_class);
+  MRB_SET_INSTANCE_TT(conf, MRB_TT_DATA);
+  mrb_define_method(mrb, conf, "initialize", mrb_conf_initialize, MRB_ARGS_REQ(1));
+  mrb_define_method(mrb, conf, "set_endpoint", mrb_conf_set_endpoint, MRB_ARGS_REQ(1));
+  mrb_define_method(mrb, conf, "set_authmode", mrb_conf_set_authmode, MRB_ARGS_REQ(1));
+  mrb_define_method(mrb, conf, "set_rng", mrb_conf_set_rng, MRB_ARGS_REQ(1));
+  mrb_define_method(mrb, conf, "set_chain", mrb_conf_set_chain, MRB_ARGS_REQ(1));
+  mrb_define_method(mrb, conf, "set_sert", mrb_conf_set_sert, MRB_ARGS_REQ(1));
+  // 0: Endpoint mode for acting as a client.
+  mrb_define_const(mrb, conf, "SSL_IS_CLIENT", mrb_fixnum_value(MBEDTLS_SSL_IS_CLIENT));
+  mrb_define_const(mrb, conf, "SSL_IS_SERVER", mrb_fixnum_value(MBEDTLS_SSL_IS_SERVER));
+  // 0: Certificate verification mode for doing no verification.
+  mrb_define_const(mrb, conf, "SSL_VERIFY_NONE", mrb_fixnum_value(MBEDTLS_SSL_VERIFY_NONE));
+  // 1: Certificate verification mode for optional verification.
+  mrb_define_const(mrb, conf, "SSL_VERIFY_OPTIONAL", mrb_fixnum_value(MBEDTLS_SSL_VERIFY_OPTIONAL));
+  // 2: Certificate verification mode for having required verification.
+  mrb_define_const(mrb, conf, "SSL_VERIFY_REQUIRED", mrb_fixnum_value(MBEDTLS_SSL_VERIFY_REQUIRED));
+  
   s = mrb_define_class_under(mrb, p, "SSL", mrb->object_class);
   MRB_SET_INSTANCE_TT(s, MRB_TT_DATA);
   mrb_define_method(mrb, s, "initialize", mrb_ssl_initialize, MRB_ARGS_NONE());
-  // 0: Endpoint mode for acting as a client.
-  mrb_define_const(mrb, s, "SSL_IS_CLIENT", mrb_fixnum_value(MBEDTLS_SSL_IS_CLIENT));
-  // 0: Certificate verification mode for doing no verification.
-  mrb_define_const(mrb, s, "SSL_VERIFY_NONE", mrb_fixnum_value(MBEDTLS_SSL_VERIFY_NONE));
-  // 1: Certificate verification mode for optional verification.
-  mrb_define_const(mrb, s, "SSL_VERIFY_OPTIONAL", mrb_fixnum_value(MBEDTLS_SSL_VERIFY_OPTIONAL));
-  // 2: Certificate verification mode for having required verification.
-  mrb_define_const(mrb, s, "SSL_VERIFY_REQUIRED", mrb_fixnum_value(MBEDTLS_SSL_VERIFY_REQUIRED));
-  mrb_define_method(mrb, s, "set_endpoint", mrb_ssl_set_endpoint, MRB_ARGS_REQ(1));
-  mrb_define_method(mrb, s, "set_authmode", mrb_ssl_set_authmode, MRB_ARGS_REQ(1));
-  mrb_define_method(mrb, s, "set_rng", mrb_ssl_set_rng, MRB_ARGS_REQ(1));
+  mrb_define_method(mrb, s, "setup", mrb_ssl_setup, MRB_ARGS_REQ(1));
   mrb_define_method(mrb, s, "set_socket", mrb_ssl_set_socket, MRB_ARGS_REQ(1));
   mrb_define_method(mrb, s, "set_hostname", mrb_ssl_set_hostname, MRB_ARGS_REQ(1));
   mrb_define_method(mrb, s, "handshake", mrb_ssl_handshake, MRB_ARGS_NONE());
@@ -737,6 +923,7 @@ void mrb_mruby_polarssl_gem_init(mrb_state *mrb) {
   mrb_define_method(mrb, s, "fileno", mrb_ssl_fileno, MRB_ARGS_NONE());
   mrb_define_method(mrb, s, "close_notify", mrb_ssl_close_notify, MRB_ARGS_NONE());
   mrb_define_method(mrb, s, "close", mrb_ssl_close, MRB_ARGS_NONE());
+  mrb_define_method(mrb, s, "reset", mrb_ssl_reset, MRB_ARGS_NONE());
 
   ecdsa = mrb_define_class_under(mrb, pkey, "EC", mrb->object_class);
   MRB_SET_INSTANCE_TT(ecdsa, MRB_TT_DATA);
